@@ -1,6 +1,7 @@
 from memory_class import memory
 import numpy as np
 import pandas as pd
+import math
 
 class Trading_Agent:
     def __init__(self, name, test_length, longterm_period, garch_look_back, VRP_rv22_threshold, VRP_lt_threshold, VRP_garch_threshold):
@@ -21,21 +22,50 @@ class Trading_Agent:
         self.cum_pnl_history = []
         self.cum_long_pnl_history = []
         self.cum_short_pnl_history = []
+        self.force_close = False
     
     def feed_data(self, vix,vvix,spx,rv22):
         self.memory.memorize(vix,vvix,spx,rv22)
 
     @staticmethod
-    def _latest_zscore(x):
+    def _norm_cdf(x):
+        return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+    @classmethod
+    def _kde_percentile(cls, x):
         arr = np.asarray(x, dtype=float)
         arr = arr[np.isfinite(arr)]
         if arr.size < 2:
             return np.nan
-        mu = float(np.mean(arr))
-        sigma = float(np.std(arr))
-        if sigma < 1e-12:
-            return 0.0
-        return float((arr[-1] - mu) / sigma)
+
+        x0 = float(arr[-1])
+        sample = arr[:-1] if arr.size > 2 else arr
+        n = sample.size
+        if n < 2:
+            return np.nan
+
+        std = float(np.std(sample, ddof=1))
+        if (not np.isfinite(std)) or std < 1e-12:
+            # Degenerate case: fallback to empirical percentile
+            return float(np.mean(sample <= x0))
+
+        # Silverman's rule-of-thumb bandwidth
+        h = 1.06 * std * (n ** (-1.0 / 5.0))
+        h = max(float(h), 1e-6)
+
+        z = (x0 - sample) / h
+        cdf_vals = np.array([cls._norm_cdf(float(v)) for v in z], dtype=float)
+        p = float(np.mean(cdf_vals))
+        return min(max(p, 0.0), 1.0)
+
+    @classmethod
+    def _kde_cdf_signal(cls, x):
+        p = cls._kde_percentile(x)
+        if not np.isfinite(p):
+            return 0
+
+        # map percentile p in [0, 1] to continuous signal in [-1, 1]
+        return float(2.0 * p - 1.0)
 
     def signal(self):
         vix_test     = self.memory.vix[-self.test_length:]
@@ -48,31 +78,24 @@ class Trading_Agent:
         VRP_lt_test = self.memory.VRP_lt[-self.test_length:]
         VRP_garch_test = self.memory.VRP_garch[-self.test_length:]
 
-        latest_z_score_rv22 = self._latest_zscore(VRP_rv22_test)
-        if latest_z_score_rv22 >= self.VRP_rv22_threshold:
-            rv22_signal = -1
-        elif latest_z_score_rv22 <= -self.VRP_rv22_threshold:
-            rv22_signal = 1
-        else:
-            rv22_signal = 0
+        rv22_signal = self._kde_cdf_signal(VRP_rv22_test)
+        lt_signal = self._kde_cdf_signal(VRP_lt_test)
+        garch_signal = self._kde_cdf_signal(VRP_garch_test)
 
-        latest_z_score_lt = self._latest_zscore(VRP_lt_test)
-        if latest_z_score_lt >= self.VRP_lt_threshold:
-            lt_signal = -1
-        elif latest_z_score_lt <= -self.VRP_lt_threshold:
-            lt_signal = 1
-        else:
-            lt_signal = 0
-            
-        latest_z_score_garch = self._latest_zscore(VRP_garch_test)
-        if latest_z_score_garch >= self.VRP_garch_threshold:
-            garch_signal = -1
-        elif latest_z_score_garch <= -self.VRP_garch_threshold:
-            garch_signal = 1
-        else:
-            garch_signal = 0
-            
-        return rv22_signal + lt_signal + garch_signal
+        # Keep compatibility with existing notebook setup:
+        # threshold >= 100 means "disable this factor".
+        active_signals = []
+        if float(self.VRP_rv22_threshold) < 100.0:
+            active_signals.append(rv22_signal)
+        if float(self.VRP_lt_threshold) < 100.0:
+            active_signals.append(lt_signal)
+        if float(self.VRP_garch_threshold) < 100.0:
+            active_signals.append(garch_signal)
+
+        if len(active_signals) == 0:
+            return 0.0
+
+        return float(np.mean(active_signals))
     
     def search_option(self, option_chain, delta, ttm, option_type):
         # Filter by option type and ensure it has a valid close price
@@ -103,12 +126,19 @@ class Trading_Agent:
 
     def trade(self, option_chain, trading_signal):
         d50_t22_c = self.search_option(option_chain, delta=0.5, ttm=22, option_type='call')
-        d50_t22_p = self.search_option(option_chain, delta=0.5, ttm=22, option_type='put')
-        
-        if trading_signal >= 1 and d50_t22_c is not None:
+        # Core regime rule:
+        # - short vol when signal > 0.8
+        # - long vol when signal < -0.8
+        # - close when signal in [-0.1, 0.1]
+        if -0.1 <= trading_signal <= 0.1:
+            self.force_close = True
+            return
+
+        self.force_close = False
+        if trading_signal <= -0.8 and d50_t22_c is not None:
             self.long_positions.append(d50_t22_c)
-        elif trading_signal <= -1 and d50_t22_p is not None:
-            self.short_positions.append(d50_t22_p)
+        elif trading_signal >= 0.8 and d50_t22_c is not None:
+            self.short_positions.append(d50_t22_c)
 
     def calculate_pnl(self, option_chain, today, vix_close):
         unrealized_long = 0.0
@@ -171,7 +201,19 @@ class Trading_Agent:
                 
         total_short_pnl = self.realized_short_pnl + unrealized_short
         self.cum_short_pnl_history.append(total_short_pnl)
-        
+
+        # Force-close in neutral regime using marked price of the day.
+        if self.force_close:
+            for pos in self.long_positions:
+                self.realized_long_pnl += (pos["last_price"] - pos["entry_price"])
+            for pos in self.short_positions:
+                self.realized_short_pnl += (pos["entry_price"] - pos["last_price"])
+            self.long_positions.clear()
+            self.short_positions.clear()
+            total_long_pnl = self.realized_long_pnl
+            total_short_pnl = self.realized_short_pnl
+            self.force_close = False
+
         self.cum_pnl_history.append(total_long_pnl + total_short_pnl)
 
     def get_cum_pnl(self):
