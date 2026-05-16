@@ -39,27 +39,27 @@ class Trading_Agent:
         z_score_rv22 = (VRP_rv22_test - np.mean(VRP_rv22_test)) / np.std(VRP_rv22_test)
         latest_z_score_rv22 = z_score_rv22[-1]
         if latest_z_score_rv22 >= self.VRP_rv22_threshold:
-            rv22_signal = 1
-        elif latest_z_score_rv22 <= -self.VRP_rv22_threshold:
             rv22_signal = -1
+        elif latest_z_score_rv22 <= -self.VRP_rv22_threshold:
+            rv22_signal = 1
         else:
             rv22_signal = 0
 
         z_score_lt = (VRP_lt_test - np.mean(VRP_lt_test)) / np.std(VRP_lt_test)
         latest_z_score_lt = z_score_lt[-1]
         if latest_z_score_lt >= self.VRP_lt_threshold:
-            lt_signal = 1
-        elif latest_z_score_lt <= -self.VRP_lt_threshold:
             lt_signal = -1
+        elif latest_z_score_lt <= -self.VRP_lt_threshold:
+            lt_signal = 1
         else:
             lt_signal = 0
             
         z_score_garch = (VRP_garch_test - np.mean(VRP_garch_test)) / np.std(VRP_garch_test)
         latest_z_score_garch = z_score_garch[-1]
         if latest_z_score_garch >= self.VRP_garch_threshold:
-            garch_signal = 1
-        elif latest_z_score_garch <= -self.VRP_garch_threshold:
             garch_signal = -1
+        elif latest_z_score_garch <= -self.VRP_garch_threshold:
+            garch_signal = 1
         else:
             garch_signal = 0
             
