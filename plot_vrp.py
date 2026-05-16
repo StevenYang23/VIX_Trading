@@ -41,11 +41,13 @@ def plot_vrp(Agents):
     rv22_sample = random_window(a.memory.VRP_rv22, test_len)
     lt_sample = random_window(a.memory.VRP_lt, test_len)
     garch_sample = random_window(a.memory.VRP_garch, test_len)
+    vvix_vix_sample = random_window(a.memory.vvix_vix, test_len)
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    fig, axes = plt.subplots(1, 4, figsize=(15, 4))
     plot_kde(axes[0], rv22_sample, f'VRP_rv22 KDE (random window={test_len})', 'skyblue')
     plot_kde(axes[1], lt_sample, f'VRP_lt KDE (random window={test_len})', 'salmon')
     plot_kde(axes[2], garch_sample, f'VRP_garch KDE (random window={test_len})', 'lightgreen')
+    plot_kde(axes[3], vvix_vix_sample, f'VVIX_VIX KDE (random window={test_len})', 'plum')
 
     plt.tight_layout()
     plt.show()

@@ -18,6 +18,14 @@ class Trading_Agent:
         initial_balance=4000.0,
         k=4.0,
         contract_multiplier=100,
+        Max_holding=2,
+        w_rv22=0.35,
+        w_lt=0.15,
+        w_garch=0.35,
+        w_vvix_vix=0.15,
+        entry_threshold=2.0,
+        exit_threshold=1.0,
+        vvix_short_gate=110.0,
     ):
         self.name = name
         self.longterm_period = longterm_period
@@ -33,12 +41,28 @@ class Trading_Agent:
         self.balance = float(initial_balance)
         self.k = max(float(k), 1.0)
         self.contract_multiplier = max(int(contract_multiplier), 1)
+        self.max_holding = max(int(Max_holding), 1)
+        self.signal_weights = {
+            "rv22": float(w_rv22),
+            "lt": float(w_lt),
+            "garch": float(w_garch),
+            "vvix_vix": float(w_vvix_vix),
+        }
+        self.entry_threshold = float(entry_threshold)
+        self.exit_threshold = float(exit_threshold)
+        self.vvix_short_gate = float(vvix_short_gate)
+        # Hysteresis state: -1 short-vol regime, 0 neutral, +1 long-vol regime
+        self._signal_state = 0
 
-        # Position buckets
-        # long_positions  => buy calls (long vol)
-        # short_positions => buy puts  (short vol expression)
-        self.long_positions = []
-        self.short_positions = []
+        # New spread-level position engine
+        # Each element is a spread dict, each spread has:
+        # - purpose: long_vol / short_vol
+        # - strategy_name: bucket name
+        # - qty: number of spreads
+        # - legs: [{ticker, side, entry_price, last_price, strike_price, contract_type, expiration_date}, ...]
+        self.strategy_positions = []
+        # Explicit list requested: tracks purpose of each opened spread
+        self.position_purposes = []
 
         # PnL trackers
         self.realized_long_pnl = 0.0
@@ -49,9 +73,6 @@ class Trading_Agent:
         self.cum_short_pnl_history = []
         self.balance_history = []
         self.equity_history = []
-
-        self.force_close_longs = False
-        self.force_close_shorts = False
 
     def feed_data(self, vix, vvix, spx, rv22):
         self.memory.memorize(vix, vvix, spx, rv22)
@@ -104,9 +125,9 @@ class Trading_Agent:
                 return 0.0
             kde_val = self._kde_cdf_signal(data_series)
             if kde_val > float(threshold):
-                return -1.0  # High VRP -> Short Vol (buy put)
+                return -1.0  # High VRP -> Short Vol
             if kde_val < -float(threshold):
-                return 1.0   # Low VRP -> Long Vol (buy call)
+                return 1.0   # Low VRP -> Long Vol
             return 0.0
 
         rv22_signal = get_discrete_signal(VRP_rv22_test, self.VRP_rv22_threshold)
@@ -114,14 +135,42 @@ class Trading_Agent:
         garch_signal = get_discrete_signal(VRP_garch_test, self.VRP_garch_threshold)
         vvix_vix_signal = get_discrete_signal(vvix_vix_test, self.vvix_vix_threshold)
 
-        total_signal = rv22_signal + lt_signal + garch_signal + vvix_vix_signal
+        # Weighted composite signal (replaces equal-vote sum)
+        weighted_signal = (
+            self.signal_weights["rv22"] * rv22_signal
+            + self.signal_weights["lt"] * lt_signal
+            + self.signal_weights["garch"] * garch_signal
+            + self.signal_weights["vvix_vix"] * vvix_vix_signal
+        )
+        total_signal = 4.0 * weighted_signal
 
+        # Extra VVIX override signal
         if vvix_test:
             current_vvix = vvix_test[-1]
-            if current_vvix > 110:
+            if current_vvix > self.vvix_short_gate:
                 total_signal -= 1.5
+                # Regime gate: under stress VVIX, block NEW short-vol impulse.
+                if total_signal < 0:
+                    total_signal = 0.0
 
-        return float(total_signal)
+        # Hysteresis layer (entry/exit separated to reduce churn)
+        if self._signal_state == 0:
+            if total_signal >= self.entry_threshold:
+                self._signal_state = 1
+            elif total_signal <= -self.entry_threshold:
+                self._signal_state = -1
+        elif self._signal_state == 1:
+            if total_signal <= self.exit_threshold:
+                self._signal_state = 0
+        else:  # self._signal_state == -1
+            if total_signal >= -self.exit_threshold:
+                self._signal_state = 0
+
+        if self._signal_state == 0:
+            return 0.0
+        if self._signal_state > 0:
+            return float(max(total_signal, self.entry_threshold))
+        return float(min(total_signal, -self.entry_threshold))
 
     def search_option(self, option_chain, delta, ttm, option_type):
         chain_filtered = option_chain[
@@ -152,126 +201,276 @@ class Trading_Agent:
             "contract_type": closest_option["contract_type"].lower(),
         }
 
-    def _open_position(self, bucket, option):
-        if option is None:
-            return
+    def _strategy_from_signal(self, trading_signal):
+        if trading_signal >= 3:
+            return {
+                "purpose": "long_vol",
+                "strategy_name": "bull_call_spread_20_10",
+                "legs": [
+                    {"delta": 0.2, "option_type": "call", "side": +1},
+                    {"delta": 0.1, "option_type": "call", "side": -1},
+                ],
+            }
+        if trading_signal >= 2:
+            return {
+                "purpose": "long_vol",
+                "strategy_name": "bull_call_spread_50_30",
+                "legs": [
+                    {"delta": 0.5, "option_type": "call", "side": +1},
+                    {"delta": 0.3, "option_type": "call", "side": -1},
+                ],
+            }
+        if trading_signal >= 1:
+            return {
+                "purpose": "long_vol",
+                "strategy_name": "digital_bull_call_spread_atm",
+                "legs": [
+                    {"delta": 0.5, "option_type": "call", "side": +1},
+                    {"delta": 0.4, "option_type": "call", "side": -1},
+                ],
+            }
+        if trading_signal <= -3:
+            return {
+                "purpose": "short_vol",
+                "strategy_name": "bear_call_spread_20_10",
+                "legs": [
+                    {"delta": 0.2, "option_type": "call", "side": -1},
+                    {"delta": 0.1, "option_type": "call", "side": +1},
+                ],
+            }
+        if trading_signal <= -2:
+            return {
+                "purpose": "short_vol",
+                "strategy_name": "bear_call_spread_50_30",
+                "legs": [
+                    {"delta": 0.5, "option_type": "call", "side": -1},
+                    {"delta": 0.3, "option_type": "call", "side": +1},
+                ],
+            }
+        if trading_signal <= -1:
+            return {
+                "purpose": "short_vol",
+                "strategy_name": "digital_bear_call_spread_atm",
+                "legs": [
+                    {"delta": 0.5, "option_type": "call", "side": -1},
+                    {"delta": 0.4, "option_type": "call", "side": +1},
+                ],
+            }
+        return None
+        
+    def _build_spread(self, option_chain, strategy_def, ttm=45):
+        legs = []
+        for leg_def in strategy_def["legs"]:
+            opt = self.search_option(
+                option_chain,
+                delta=leg_def["delta"],
+                ttm=ttm,
+                option_type=leg_def["option_type"],
+            )
+            if opt is None:
+                return None
 
-        contract_cost = option["entry_price"] * self.contract_multiplier
-        if contract_cost <= 0.0:
-            return
+            leg = dict(opt)
+            leg["side"] = int(leg_def["side"])  # +1 long, -1 short
+            legs.append(leg)
+
+        expiration_date = min(leg["expiration_date"] for leg in legs)
+
+        return {
+            "purpose": strategy_def["purpose"],
+            "strategy_name": strategy_def["strategy_name"],
+            "qty": 0,
+            "legs": legs,
+            "expiration_date": expiration_date,
+        }
+
+    def _spread_width_per_spread(self, spread):
+        call_strikes = [leg["strike_price"] for leg in spread["legs"] if leg["contract_type"] == "call"]
+        put_strikes = [leg["strike_price"] for leg in spread["legs"] if leg["contract_type"] == "put"]
+
+        if len(call_strikes) >= 2:
+            return (max(call_strikes) - min(call_strikes)) * self.contract_multiplier
+        if len(put_strikes) >= 2:
+            return (max(put_strikes) - min(put_strikes)) * self.contract_multiplier
+        return 0.0
+
+    def _open_spread(self, spread):
+        if len(self.strategy_positions) >= self.max_holding:
+            return False
+
+        # Per-spread opening cashflow:
+        # side +1 long -> pay premium (negative cashflow)
+        # side -1 short -> receive premium (positive cashflow)
+        open_cash_flow_per_spread = 0.0
+        for leg in spread["legs"]:
+            open_cash_flow_per_spread += -leg["side"] * leg["entry_price"] * self.contract_multiplier
+
+        net_debit_per_spread = max(-open_cash_flow_per_spread, 0.0)
+        net_credit_per_spread = max(open_cash_flow_per_spread, 0.0)
+        spread_width_per_spread = self._spread_width_per_spread(spread)
+
+        # Requested risk sizing model:
+        # - long spread: use net debit
+        # - short spread: use max loss = spread width - credit
+        if spread["purpose"] == "long_vol":
+            risk_per_spread = net_debit_per_spread
+        else:
+            risk_per_spread = max(spread_width_per_spread - net_credit_per_spread, 0.0)
+
+        if risk_per_spread <= 0.0:
+            return False
 
         allocation = self.balance / self.k
-        qty = int(allocation // contract_cost)
+        qty = int(allocation // risk_per_spread)
         if qty <= 0:
-            return
+            return False
 
-        invested = qty * contract_cost
-        self.balance -= invested
+        self.balance += open_cash_flow_per_spread * qty
+        spread["qty"] = qty
+        spread["risk_per_spread"] = float(risk_per_spread)
+        spread["open_cash_flow_per_spread"] = float(open_cash_flow_per_spread)
+        self.strategy_positions.append(spread)
+        self.position_purposes.append(spread["purpose"])
+        return True
 
-        pos = dict(option)
-        pos["qty"] = qty
-        pos["invested"] = invested
-        bucket.append(pos)
+    def _update_leg_mark(self, leg, option_chain):
+        target_opt = option_chain[option_chain["ticker"] == leg["ticker"]]
+        if not target_opt.empty:
+            current_price = target_opt["close"].iloc[-1]
+            if pd.notna(current_price) and np.isfinite(float(current_price)) and float(current_price) >= 0.0:
+                leg["last_price"] = float(current_price)
 
-    def trade(self, option_chain, trading_signal):
-        d50_t22_c = self.search_option(option_chain, delta=0.5, ttm=22, option_type="call")
-        d50_t22_p = self.search_option(option_chain, delta=-0.5, ttm=22, option_type="put")
+    def _refresh_spread_marks(self, spread, option_chain):
+        for leg in spread["legs"]:
+            self._update_leg_mark(leg, option_chain)
 
-        self.force_close_longs = False
-        self.force_close_shorts = False
+    def _intrinsic_value(self, leg, vix_close):
+        strike = leg["strike_price"]
+        if leg["contract_type"] == "call":
+            return max(0.0, float(vix_close) - strike)
+        return max(0.0, strike - float(vix_close))
 
-        if -1 < trading_signal < 1:
-            self.force_close_longs = True
-            self.force_close_shorts = True
-            return
+    def _close_spread(self, spread, option_chain=None, use_expiry=False, vix_close=None):
+        qty = spread["qty"]
+        close_cash_flow = 0.0
+        spread_pnl = 0.0
 
-        if trading_signal >= 1:
-            self.force_close_shorts = True
-            self._open_position(self.long_positions, d50_t22_c)
-        elif trading_signal <= -1:
-            self.force_close_longs = True
-            self._open_position(self.short_positions, d50_t22_p)
+        for leg in spread["legs"]:
+            if use_expiry:
+                val = self._intrinsic_value(leg, vix_close)
+            else:
+                if option_chain is not None:
+                    self._update_leg_mark(leg, option_chain)
+                val = float(leg["last_price"])
 
-    def _update_position_marks(self, positions, option_chain):
-        for pos in positions:
-            target_opt = option_chain[option_chain["ticker"] == pos["ticker"]]
-            if not target_opt.empty:
-                current_price = target_opt["close"].iloc[-1]
-                if pd.notna(current_price) and np.isfinite(float(current_price)) and float(current_price) >= 0.0:
-                    pos["last_price"] = float(current_price)
+            # Close cash flow: side * value * qty * multiplier
+            # long(+1): receive +value, short(-1): pay -value
+            close_cash_flow += leg["side"] * val * qty * self.contract_multiplier
 
-    def _settle_expired_positions(self, positions, today_ts, vix_close, is_long_bucket):
-        realized_delta = 0.0
-        for i in range(len(positions) - 1, -1, -1):
-            pos = positions[i]
-            if today_ts >= pos["expiration_date"]:
-                if pos["contract_type"] == "call":
-                    payoff = max(0.0, float(vix_close) - pos["strike_price"])
-                else:
-                    payoff = max(0.0, pos["strike_price"] - float(vix_close))
+            # PnL: side * (close - entry)
+            spread_pnl += leg["side"] * (val - leg["entry_price"]) * qty * self.contract_multiplier
 
-                proceeds = payoff * pos["qty"] * self.contract_multiplier
-                pnl = (payoff - pos["entry_price"]) * pos["qty"] * self.contract_multiplier
+        self.balance += close_cash_flow
 
-                self.balance += proceeds
-                realized_delta += pnl
-                positions.pop(i)
-
-        if is_long_bucket:
-            self.realized_long_pnl += realized_delta
+        if spread["purpose"] == "long_vol":
+            self.realized_long_pnl += spread_pnl
         else:
-            self.realized_short_pnl += realized_delta
+            self.realized_short_pnl += spread_pnl
 
-    def _liquidate_positions(self, positions, is_long_bucket):
-        realized_delta = 0.0
-        for pos in positions:
-            last_price = float(pos["last_price"])
-            proceeds = last_price * pos["qty"] * self.contract_multiplier
-            pnl = (last_price - pos["entry_price"]) * pos["qty"] * self.contract_multiplier
+    def _close_positions_by_purpose(self, purpose, option_chain):
+        kept = []
+        for spread in self.strategy_positions:
+            if spread["purpose"] == purpose:
+                self._close_spread(spread, option_chain=option_chain, use_expiry=False)
+            else:
+                kept.append(spread)
+        self.strategy_positions = kept
+        self.position_purposes = [s["purpose"] for s in self.strategy_positions]
 
-            self.balance += proceeds
-            realized_delta += pnl
+    def _close_all_positions(self, option_chain):
+        for spread in self.strategy_positions:
+            self._close_spread(spread, option_chain=option_chain, use_expiry=False)
+        self.strategy_positions = []
+        self.position_purposes = []
 
-        positions.clear()
+    def _unrealized_pnl_split(self):
+        unreal_long = 0.0
+        unreal_short = 0.0
 
-        if is_long_bucket:
-            self.realized_long_pnl += realized_delta
-        else:
-            self.realized_short_pnl += realized_delta
+        for spread in self.strategy_positions:
+            qty = spread["qty"]
+            spread_unreal = 0.0
+            for leg in spread["legs"]:
+                spread_unreal += leg["side"] * (leg["last_price"] - leg["entry_price"]) * qty * self.contract_multiplier
 
-    def _compute_unrealized(self, positions):
-        unrealized = 0.0
-        for pos in positions:
-            unrealized += (pos["last_price"] - pos["entry_price"]) * pos["qty"] * self.contract_multiplier
-        return float(unrealized)
+            if spread["purpose"] == "long_vol":
+                unreal_long += spread_unreal
+            else:
+                unreal_short += spread_unreal
+
+        return float(unreal_long), float(unreal_short)
 
     def _positions_market_value(self):
         total = 0.0
-        for pos in self.long_positions:
-            total += pos["last_price"] * pos["qty"] * self.contract_multiplier
-        for pos in self.short_positions:
-            total += pos["last_price"] * pos["qty"] * self.contract_multiplier
+        for spread in self.strategy_positions:
+            qty = spread["qty"]
+            for leg in spread["legs"]:
+                total += leg["side"] * leg["last_price"] * qty * self.contract_multiplier
         return float(total)
+
+    def trade(self, option_chain, trading_signal):
+        """
+        Signal regime mapping:
+        3 <= s: close short_vol purpose, open long_vol 20/10 call spread
+        2 <= s < 3: close short_vol purpose, open long_vol 50/30 call spread
+        1 <= s < 2: close short_vol purpose, open long_vol atm digital-like spread
+       -1 <= s < 1: close all
+       -2 <= s < -1: close long_vol purpose, open short_vol atm digital-like spread
+       -3 <= s < -2: close long_vol purpose, open short_vol 50/30 call spread
+             s < -3: close long_vol purpose, open short_vol 20/10 call spread
+        """
+        target = self._strategy_from_signal(trading_signal)
+
+        if target is None:
+            self._close_all_positions(option_chain)
+            return
+
+        opposite = "short_vol" if target["purpose"] == "long_vol" else "long_vol"
+        self._close_positions_by_purpose(opposite, option_chain)
+
+        # If same strategy already exists, keep it (no re-open churn).
+        active_same = any(
+            s["purpose"] == target["purpose"] and s["strategy_name"] == target["strategy_name"]
+            for s in self.strategy_positions
+        )
+        if active_same:
+            return
+
+        # Close same-purpose but different strategy, then open new one.
+        self._close_positions_by_purpose(target["purpose"], option_chain)
+        spread = self._build_spread(option_chain, target, ttm=45)
+        if spread is not None:
+            self._open_spread(spread)
 
     def calculate_pnl(self, option_chain, today, vix_close):
         today_ts = pd.Timestamp(today)
 
-        self._update_position_marks(self.long_positions, option_chain)
-        self._update_position_marks(self.short_positions, option_chain)
+        # Mark to market all open spreads.
+        for spread in self.strategy_positions:
+            self._refresh_spread_marks(spread, option_chain)
 
-        self._settle_expired_positions(self.long_positions, today_ts, vix_close, is_long_bucket=True)
-        self._settle_expired_positions(self.short_positions, today_ts, vix_close, is_long_bucket=False)
+        # Settle expired spreads.
+        kept = []
+        for spread in self.strategy_positions:
+            if today_ts >= spread["expiration_date"]:
+                self._close_spread(spread, use_expiry=True, vix_close=vix_close)
+            else:
+                kept.append(spread)
 
-        if self.force_close_longs:
-            self._liquidate_positions(self.long_positions, is_long_bucket=True)
-            self.force_close_longs = False
+        self.strategy_positions = kept
+        self.position_purposes = [s["purpose"] for s in self.strategy_positions]
 
-        if self.force_close_shorts:
-            self._liquidate_positions(self.short_positions, is_long_bucket=False)
-            self.force_close_shorts = False
-
-        unrealized_long = self._compute_unrealized(self.long_positions)
-        unrealized_short = self._compute_unrealized(self.short_positions)
+        unrealized_long, unrealized_short = self._unrealized_pnl_split()
 
         total_long_pnl = self.realized_long_pnl + unrealized_long
         total_short_pnl = self.realized_short_pnl + unrealized_short
@@ -303,7 +502,7 @@ class Trading_Agent:
     def get_long_short_pnl(self):
         return {
             "long_vol_buy_call_pnl": float(self.realized_long_pnl),
-            "short_vol_buy_put_pnl": float(self.realized_short_pnl),
+            "short_vol_call_spread_pnl": float(self.realized_short_pnl),
         }
 
     def get_log_returns(self, initial_capital=None):
