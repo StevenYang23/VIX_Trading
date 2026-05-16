@@ -25,6 +25,18 @@ class Trading_Agent:
     def feed_data(self, vix,vvix,spx,rv22):
         self.memory.memorize(vix,vvix,spx,rv22)
 
+    @staticmethod
+    def _latest_zscore(x):
+        arr = np.asarray(x, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        if arr.size < 2:
+            return np.nan
+        mu = float(np.mean(arr))
+        sigma = float(np.std(arr))
+        if sigma < 1e-12:
+            return 0.0
+        return float((arr[-1] - mu) / sigma)
+
     def signal(self):
         vix_test     = self.memory.vix[-self.test_length:]
         vvix_test = self.memory.vvix[-self.test_length:]
@@ -36,8 +48,7 @@ class Trading_Agent:
         VRP_lt_test = self.memory.VRP_lt[-self.test_length:]
         VRP_garch_test = self.memory.VRP_garch[-self.test_length:]
 
-        z_score_rv22 = (VRP_rv22_test - np.mean(VRP_rv22_test)) / np.std(VRP_rv22_test)
-        latest_z_score_rv22 = z_score_rv22[-1]
+        latest_z_score_rv22 = self._latest_zscore(VRP_rv22_test)
         if latest_z_score_rv22 >= self.VRP_rv22_threshold:
             rv22_signal = -1
         elif latest_z_score_rv22 <= -self.VRP_rv22_threshold:
@@ -45,8 +56,7 @@ class Trading_Agent:
         else:
             rv22_signal = 0
 
-        z_score_lt = (VRP_lt_test - np.mean(VRP_lt_test)) / np.std(VRP_lt_test)
-        latest_z_score_lt = z_score_lt[-1]
+        latest_z_score_lt = self._latest_zscore(VRP_lt_test)
         if latest_z_score_lt >= self.VRP_lt_threshold:
             lt_signal = -1
         elif latest_z_score_lt <= -self.VRP_lt_threshold:
@@ -54,8 +64,7 @@ class Trading_Agent:
         else:
             lt_signal = 0
             
-        z_score_garch = (VRP_garch_test - np.mean(VRP_garch_test)) / np.std(VRP_garch_test)
-        latest_z_score_garch = z_score_garch[-1]
+        latest_z_score_garch = self._latest_zscore(VRP_garch_test)
         if latest_z_score_garch >= self.VRP_garch_threshold:
             garch_signal = -1
         elif latest_z_score_garch <= -self.VRP_garch_threshold:
