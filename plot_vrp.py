@@ -36,7 +36,7 @@ def plot_kde(ax, sample, title, color):
     ax.set_ylabel('Density')
 
 def plot_vrp(Agents):
-    a = Agents[0]
+    a = Agents
     test_len = a.test_length
     rv22_sample = random_window(a.memory.VRP_rv22, test_len)
     lt_sample = random_window(a.memory.VRP_lt, test_len)

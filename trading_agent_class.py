@@ -4,7 +4,7 @@ import pandas as pd
 import math
 
 class Trading_Agent:
-    def __init__(self, name, test_length, longterm_period, garch_look_back, VRP_rv22_threshold, VRP_lt_threshold, VRP_garch_threshold):
+    def __init__(self, name, test_length, longterm_period, garch_look_back, VRP_rv22_threshold, VRP_lt_threshold, VRP_garch_threshold, vvix_vix_threshold):
         self.name = name
         self.longterm_period = longterm_period
         self.test_length = test_length
@@ -12,6 +12,7 @@ class Trading_Agent:
         self.VRP_rv22_threshold = VRP_rv22_threshold
         self.VRP_lt_threshold = VRP_lt_threshold
         self.VRP_garch_threshold = VRP_garch_threshold
+        self.vvix_vix_threshold = vvix_vix_threshold
 
         self.long_positions = []
         self.short_positions = []
@@ -22,7 +23,13 @@ class Trading_Agent:
         self.cum_pnl_history = []
         self.cum_long_pnl_history = []
         self.cum_short_pnl_history = []
-        self.force_close = False
+        self.daily_log_returns = []
+        self.cum_log_returns = []
+        self.current_exposure = 0.0
+        self.previous_cum_pnl = 0.0
+        
+        self.force_close_longs = False
+        self.force_close_shorts = False
     
     def feed_data(self, vix,vvix,spx,rv22):
         self.memory.memorize(vix,vvix,spx,rv22)
@@ -68,7 +75,7 @@ class Trading_Agent:
         return float(2.0 * p - 1.0)
 
     def signal(self):
-        vix_test     = self.memory.vix[-self.test_length:]
+        vix_test = self.memory.vix[-self.test_length:]
         vvix_test = self.memory.vvix[-self.test_length:]
         spx_test = self.memory.spx[-self.test_length:]
         rv22_test = self.memory.rv22[-self.test_length:]
@@ -77,25 +84,32 @@ class Trading_Agent:
         VRP_rv22_test = self.memory.VRP_rv22[-self.test_length:]
         VRP_lt_test = self.memory.VRP_lt[-self.test_length:]
         VRP_garch_test = self.memory.VRP_garch[-self.test_length:]
+        vvix_vix_test = self.memory.vvix_vix[-self.test_length:]
 
-        rv22_signal = self._kde_cdf_signal(VRP_rv22_test)
-        lt_signal = self._kde_cdf_signal(VRP_lt_test)
-        garch_signal = self._kde_cdf_signal(VRP_garch_test)
-
-        # Keep compatibility with existing notebook setup:
-        # threshold >= 100 means "disable this factor".
-        active_signals = []
-        if float(self.VRP_rv22_threshold) < 100.0:
-            active_signals.append(rv22_signal)
-        if float(self.VRP_lt_threshold) < 100.0:
-            active_signals.append(lt_signal)
-        if float(self.VRP_garch_threshold) < 100.0:
-            active_signals.append(garch_signal)
-
-        if len(active_signals) == 0:
+        def get_discrete_signal(data_series, threshold):
+            if float(threshold) >= 100.0:
+                return 0.0
+            kde_val = self._kde_cdf_signal(data_series)
+            if kde_val > float(threshold):
+                return -1.0  # High VRP -> Short Vol (VIX is overvalued)
+            elif kde_val < -float(threshold):
+                return 1.0   # Low VRP -> Long Vol (VIX is undervalued)
             return 0.0
 
-        return float(np.mean(active_signals))
+        rv22_signal = get_discrete_signal(VRP_rv22_test, self.VRP_rv22_threshold)
+        lt_signal = get_discrete_signal(VRP_lt_test, self.VRP_lt_threshold)
+        garch_signal = get_discrete_signal(VRP_garch_test, self.VRP_garch_threshold)
+        vvix_vix_signal = get_discrete_signal(vvix_vix_test, self.vvix_vix_threshold)
+
+        total_signal = rv22_signal + lt_signal + garch_signal + vvix_vix_signal
+
+        # Extreme VVIX override
+        current_vvix = vvix_test[-1]
+        if current_vvix > 110:
+            # High VVIX -> panic -> VIX likely to drop -> favor SHORT (-1.5)
+            total_signal -= 1.5
+
+        return total_signal
     
     def search_option(self, option_chain, delta, ttm, option_type):
         # Filter by option type and ensure it has a valid close price
@@ -126,19 +140,28 @@ class Trading_Agent:
 
     def trade(self, option_chain, trading_signal):
         d50_t22_c = self.search_option(option_chain, delta=0.5, ttm=22, option_type='call')
-        # Core regime rule:
-        # - short vol when signal > 0.8
-        # - long vol when signal < -0.8
-        # - close when signal in [-0.1, 0.1]
-        if -0.1 <= trading_signal <= 0.1:
-            self.force_close = True
+        d50_t22_p = self.search_option(option_chain, delta=-0.5, ttm=22, option_type='put')
+        
+        self.force_close_longs = False
+        self.force_close_shorts = False
+
+        # - close when signal is strictly between -1 and 1 (e.g., 0, 0.5, -0.5)
+        if -1 < trading_signal < 1:
+            self.force_close_longs = True
+            self.force_close_shorts = True
             return
 
-        self.force_close = False
-        if trading_signal <= -0.8 and d50_t22_c is not None:
-            self.long_positions.append(d50_t22_c)
-        elif trading_signal >= 0.8 and d50_t22_c is not None:
-            self.short_positions.append(d50_t22_c)
+        # signal >= 1 means LONG vol: Buy Call
+        if trading_signal >= 1:
+            self.force_close_shorts = True  # Reversal: close short positions if any
+            if d50_t22_c is not None:
+                self.long_positions.append(d50_t22_c)
+                
+        # signal <= -1 means SHORT vol: Buy Put
+        elif trading_signal <= -1:
+            self.force_close_longs = True   # Reversal: close long positions if any
+            if d50_t22_p is not None:
+                self.short_positions.append(d50_t22_p)
 
     def calculate_pnl(self, option_chain, today, vix_close):
         unrealized_long = 0.0
@@ -173,9 +196,8 @@ class Trading_Agent:
             unrealized_long += (pos["last_price"] - pos["entry_price"])
 
         total_long_pnl = self.realized_long_pnl + unrealized_long
-        self.cum_long_pnl_history.append(total_long_pnl)
         
-        # Process short positions
+        # Process short positions (which are actually long Puts)
         for i in range(len(self.short_positions) - 1, -1, -1):
             pos = self.short_positions[i]
             
@@ -185,8 +207,8 @@ class Trading_Agent:
                 else:
                     payoff = max(0.0, pos["strike_price"] - vix_close)
                 
-                # For short positions, PnL is Entry Price - Payoff
-                self.realized_short_pnl += (pos["entry_price"] - payoff)
+                # Since we BOUGHT the put, PnL is Payoff - Entry Price
+                self.realized_short_pnl += (payoff - pos["entry_price"])
                 self.short_positions.pop(i)
                 continue
                 
@@ -196,25 +218,55 @@ class Trading_Agent:
                 if pd.notna(current_price):
                     pos["last_price"] = current_price
             
-            # For short positions, unrealized PnL is Entry Price - Current Price
-            unrealized_short += (pos["entry_price"] - pos["last_price"])
+            # Since we BOUGHT the put, unrealized PnL is Current Price - Entry Price
+            unrealized_short += (pos["last_price"] - pos["entry_price"])
                 
         total_short_pnl = self.realized_short_pnl + unrealized_short
-        self.cum_short_pnl_history.append(total_short_pnl)
 
-        # Force-close in neutral regime using marked price of the day.
-        if self.force_close:
+        # Force-close in neutral regime or reversals
+        if self.force_close_longs:
             for pos in self.long_positions:
                 self.realized_long_pnl += (pos["last_price"] - pos["entry_price"])
-            for pos in self.short_positions:
-                self.realized_short_pnl += (pos["entry_price"] - pos["last_price"])
             self.long_positions.clear()
-            self.short_positions.clear()
             total_long_pnl = self.realized_long_pnl
-            total_short_pnl = self.realized_short_pnl
-            self.force_close = False
+            self.force_close_longs = False
 
-        self.cum_pnl_history.append(total_long_pnl + total_short_pnl)
+        if self.force_close_shorts:
+            for pos in self.short_positions:
+                self.realized_short_pnl += (pos["last_price"] - pos["entry_price"])
+            self.short_positions.clear()
+            total_short_pnl = self.realized_short_pnl
+            self.force_close_shorts = False
+
+        current_cum_pnl = total_long_pnl + total_short_pnl
+        self.cum_pnl_history.append(current_cum_pnl)
+        self.cum_long_pnl_history.append(total_long_pnl)
+        self.cum_short_pnl_history.append(total_short_pnl)
+        
+        daily_pnl = current_cum_pnl - self.previous_cum_pnl
+        self.previous_cum_pnl = current_cum_pnl
+
+        cost = self.current_exposure
+
+        if cost > 0:
+            # Safeguard against log(0)
+            value_after_pnl = max(1e-6, cost + daily_pnl)
+            daily_log_ret = np.log(value_after_pnl / cost)
+        else:
+            daily_log_ret = 0.0
+
+        self.daily_log_returns.append(daily_log_ret)
+        
+        current_cum_ret = sum(self.daily_log_returns)
+        self.cum_log_returns.append(current_cum_ret)
+
+        # Update exposure for tomorrow (cost for next day)
+        new_exposure = 0.0
+        for pos in self.long_positions:
+            new_exposure += pos["last_price"]
+        for pos in self.short_positions:
+            new_exposure += pos["last_price"]
+        self.current_exposure = new_exposure
 
     def get_cum_pnl(self):
         return self.cum_pnl_history
@@ -224,3 +276,79 @@ class Trading_Agent:
 
     def get_cum_short_pnl(self):
         return self.cum_short_pnl_history
+
+    def get_log_returns(self, initial_capital=10000.0):
+        if not self.cum_pnl_history:
+            return [], [], []
+            
+        cum_pnl = np.array(self.cum_pnl_history)
+        cum_long = np.array(self.cum_long_pnl_history)
+        cum_short = np.array(self.cum_short_pnl_history)
+        
+        # Cumulative Log Return = ln(Current Value / Initial Capital)
+        # Using max(1e-6) to prevent log(0) or log(negative)
+        val_total = np.maximum(1e-6, initial_capital + cum_pnl)
+        val_long = np.maximum(1e-6, initial_capital + cum_long)
+        val_short = np.maximum(1e-6, initial_capital + cum_short)
+        
+        log_ret_total = np.log(val_total / initial_capital)
+        log_ret_long = np.log(val_long / initial_capital)
+        log_ret_short = np.log(val_short / initial_capital)
+        
+        return log_ret_total, log_ret_long, log_ret_short
+
+    def get_performance_metrics(self, initial_capital=10000.0):
+        if not self.cum_pnl_history:
+            return {}
+            
+        cum_pnl = np.array(self.cum_pnl_history)
+        net_value = initial_capital + cum_pnl
+        
+        # Calculate daily simple returns
+        daily_returns = np.zeros_like(net_value)
+        daily_returns[1:] = np.diff(net_value) / net_value[:-1]
+        
+        # Annual Return (CAGR)
+        days = len(daily_returns)
+        if days > 0:
+            # Using max(0, ...) to prevent complex numbers if net_value goes negative
+            final_value = max(1e-6, net_value[-1])
+            annual_return = (final_value / initial_capital) ** (252 / days) - 1
+        else:
+            annual_return = 0.0
+            
+        # Annual Volatility
+        annual_volatility = np.std(daily_returns) * np.sqrt(252)
+        
+        # Sharpe Ratio (assuming risk-free rate = 0)
+        if annual_volatility > 0:
+            sharpe_ratio = (np.mean(daily_returns) * 252) / annual_volatility
+        else:
+            sharpe_ratio = 0.0
+            
+        # Sortino Ratio
+        negative_returns = daily_returns[daily_returns < 0]
+        downside_std = np.std(negative_returns) * np.sqrt(252) if len(negative_returns) > 0 else 0.0
+        if downside_std > 0:
+            sortino_ratio = (np.mean(daily_returns) * 252) / downside_std
+        else:
+            sortino_ratio = 0.0
+            
+        # Max Drawdown
+        running_max = np.maximum.accumulate(net_value)
+        drawdowns = (net_value - running_max) / running_max
+        max_drawdown = np.min(drawdowns)
+        
+        return {
+            "Sharpe Ratio": sharpe_ratio,
+            "Sortino Ratio": sortino_ratio,
+            "Annual Return": annual_return,
+            "Annual Volatility": annual_volatility,
+            "Max Drawdown": max_drawdown
+        }
+
+    def get_daily_log_returns(self):
+        return self.daily_log_returns
+
+    def get_cum_log_returns(self):
+        return self.cum_log_returns

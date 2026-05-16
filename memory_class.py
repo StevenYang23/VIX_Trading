@@ -12,9 +12,11 @@ class memory:
         self.VRP_rv22 = []
         self.VRP_lt = []
         self.VRP_garch = []
+        self.vvix_vix = []
         self.rv_long_term = []
         self.garch_forecast = []
         self.garch_model = GARCHModel(look_back=garch_look_back)
+        self.vvix_vix = []
 
     @staticmethod
     def _to_pct_vol(x):
@@ -38,6 +40,8 @@ class memory:
         self.spx.append(spx)
         self.rv22.append(rv22_pct)
         self.VRP_rv22.append(vix - rv22_pct)
+        self.vvix_vix.append(vvix / vix)
+        self.vvix_vix.append(vvix/vix)
         
         if len(self.rv22) >= self.longterm_period:
             rv_long_term = np.mean(self.rv22[-self.longterm_period:])
