@@ -1,70 +1,42 @@
-from memory_class import memory
 import numpy as np
 import pandas as pd
 import math
 
-
 class Trading_Agent:
+    _MIN_SPREAD_OBS = 20
+    _EWMA_INIT_WINDOW = 20
+    _EWMA_REFIT_EVERY = 5
+    _EWMA_LAMBDA = 0.94
+    _DEFAULT_FORECAST_DAYS = 30
+
     def __init__(
         self,
-        name,
-        test_length,
-        longterm_period,
-        garch_look_back,
-        VRP_rv22_threshold,
-        VRP_lt_threshold,
-        VRP_garch_threshold,
-        vvix_vix_threshold,
+        name="Agent_Vote",
+        entry_threshold=0.8,
+        kde_rolling_window=63,
+        ewma_lambda=0.94,
+        long_term_window=40,
         initial_balance=4000.0,
         k=4.0,
         contract_multiplier=100,
         Max_holding=2,
-        w_rv22=0.35,
-        w_lt=0.15,
-        w_garch=0.35,
-        w_vvix_vix=0.15,
-        entry_threshold=2.0,
-        exit_threshold=1.0,
-        vvix_short_gate=110.0,
     ):
         self.name = name
-        self.longterm_period = longterm_period
-        self.test_length = test_length
-        self.memory = memory(longterm_period, garch_look_back)
-        self.VRP_rv22_threshold = VRP_rv22_threshold
-        self.VRP_lt_threshold = VRP_lt_threshold
-        self.VRP_garch_threshold = VRP_garch_threshold
-        self.vvix_vix_threshold = vvix_vix_threshold
-
-        # Capital management
+        self.entry_threshold = float(entry_threshold)
+        self.kde_rolling_window = max(int(kde_rolling_window), 3)
+        self.long_term_window = max(int(long_term_window), 5)
+        self._ewma_lambda = float(ewma_lambda)
+        
         self.initial_balance = float(initial_balance)
         self.balance = float(initial_balance)
         self.k = max(float(k), 1.0)
         self.contract_multiplier = max(int(contract_multiplier), 1)
         self.max_holding = max(int(Max_holding), 1)
-        self.signal_weights = {
-            "rv22": float(w_rv22),
-            "lt": float(w_lt),
-            "garch": float(w_garch),
-            "vvix_vix": float(w_vvix_vix),
-        }
-        self.entry_threshold = float(entry_threshold)
-        self.exit_threshold = float(exit_threshold)
-        self.vvix_short_gate = float(vvix_short_gate)
-        # Hysteresis state: -1 short-vol regime, 0 neutral, +1 long-vol regime
-        self._signal_state = 0
-
-        # New spread-level position engine
-        # Each element is a spread dict, each spread has:
-        # - purpose: long_vol / short_vol
-        # - strategy_name: bucket name
-        # - qty: number of spreads
-        # - legs: [{ticker, side, entry_price, last_price, strike_price, contract_type, expiration_date}, ...]
+        
         self.strategy_positions = []
-        # Explicit list requested: tracks purpose of each opened spread
         self.position_purposes = []
+        self.trade_purpose_history = []
 
-        # PnL trackers
         self.realized_long_pnl = 0.0
         self.realized_short_pnl = 0.0
 
@@ -73,104 +45,183 @@ class Trading_Agent:
         self.cum_short_pnl_history = []
         self.balance_history = []
         self.equity_history = []
-
-    def feed_data(self, vix, vvix, spx, rv22):
-        self.memory.memorize(vix, vvix, spx, rv22)
+        
+        # Methodology variables
+        self.trading_days_per_year = 252
+        self._rv_buf = []
+        self._vrp_history = []
+        self._rv_buf_max = max(self.long_term_window * 4, 512)
+        self._longterm_spread_history = []
+        self._ewma_spread_history = []
+        self._stock_close_buf = []
+        self._h = np.nan
+        self._days_since_fit = self._EWMA_REFIT_EVERY
 
     @staticmethod
     def _norm_cdf(x):
-        return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+        return 0.5 * (1.0 + math.erf(x / np.sqrt(2.0)))
 
     @classmethod
-    def _kde_percentile(cls, x):
-        arr = np.asarray(x, dtype=float)
+    def _kde_cdf_signal(cls, values):
+        arr = np.asarray(values, dtype=float)
         arr = arr[np.isfinite(arr)]
-        if arr.size < 2:
+        if arr.size < 3:
             return np.nan
 
         x0 = float(arr[-1])
-        sample = arr[:-1] if arr.size > 2 else arr
+        sample = arr[:-1]
         n = sample.size
         if n < 2:
             return np.nan
 
         std = float(np.std(sample, ddof=1))
         if (not np.isfinite(std)) or std < 1e-12:
-            return float(np.mean(sample <= x0))
+            return float(2.0 * np.mean(sample <= x0) - 1.0)
 
         h = 1.06 * std * (n ** (-1.0 / 5.0))
         h = max(float(h), 1e-6)
-
         z = (x0 - sample) / h
         cdf_vals = np.array([cls._norm_cdf(float(v)) for v in z], dtype=float)
         p = float(np.mean(cdf_vals))
-        return min(max(p, 0.0), 1.0)
-
-    @classmethod
-    def _kde_cdf_signal(cls, x):
-        p = cls._kde_percentile(x)
-        if not np.isfinite(p):
-            return 0.0
+        p = min(max(p, 0.0), 1.0)
         return float(2.0 * p - 1.0)
 
+    def _fit_ewma(self):
+        px = np.asarray(self._stock_close_buf[-(self._EWMA_INIT_WINDOW + 1) :], dtype=float)
+        px = px[np.isfinite(px)]
+        if px.size < self._EWMA_INIT_WINDOW + 1:
+            return False
+
+        log_ret = np.diff(np.log(px))
+        log_ret = log_ret[np.isfinite(log_ret)]
+        if log_ret.size < 20:
+            return False
+
+        log_ret_pct = log_ret * 100.0
+        var = float(np.var(log_ret_pct))
+        if not np.isfinite(var) or var <= 0.0:
+            return False
+        lam = float(self._ewma_lambda)
+        for r in log_ret_pct:
+            var = lam * var + (1.0 - lam) * (r * r)
+        if not np.isfinite(var) or var <= 0.0:
+            return False
+        self._h = float(var)
+        self._days_since_fit = 0
+        return True
+
+    def _update_ewma_h(self, daily_log_return):
+        if np.isnan(self._h):
+            return
+        eps_pct = daily_log_return * 100.0
+        lam = float(self._ewma_lambda)
+        self._h = lam * self._h + (1.0 - lam) * (eps_pct**2)
+
+    def _ewma_rv_annualized(self, horizon_days):
+        if np.isnan(self._h) or self._h <= 0:
+            return np.nan
+        avg_daily_var_pct = float(self._h)
+        sigma_daily = np.sqrt(avg_daily_var_pct) / 100.0
+        return sigma_daily * np.sqrt(self.trading_days_per_year)
+
+    def feed_data(self, stock_close, rv, vrp, straddle_imp_vol, days_to_strike=30):
+        curr_spot = stock_close
+        if pd.notna(curr_spot):
+            self._stock_close_buf.append(float(curr_spot))
+
+        if len(self._stock_close_buf) >= 2:
+            ret = np.log(self._stock_close_buf[-1] / self._stock_close_buf[-2])
+            if np.isfinite(ret) and not np.isnan(self._h):
+                self._update_ewma_h(ret)
+            self._days_since_fit += 1
+
+        if (
+            self._days_since_fit >= self._EWMA_REFIT_EVERY
+            and len(self._stock_close_buf) >= self._EWMA_INIT_WINDOW + 1
+        ):
+            self._fit_ewma()
+            
+        self.current_stock_close = stock_close
+        self.current_rv = rv
+        self.current_vrp = vrp
+        self.current_iv = straddle_imp_vol
+        self.current_days_to_strike = days_to_strike
+
     def signal(self):
-        vvix_test = self.memory.vvix[-self.test_length:]
-        VRP_rv22_test = self.memory.VRP_rv22[-self.test_length:]
-        VRP_lt_test = self.memory.VRP_lt[-self.test_length:]
-        VRP_garch_test = self.memory.VRP_garch[-self.test_length:]
-        vvix_vix_test = self.memory.vvix_vix[-self.test_length:]
+        curr_iv = self.current_iv
+        curr_rv = self.current_rv
+        vrp = self.current_vrp
 
-        def get_discrete_signal(data_series, threshold):
-            if float(threshold) >= 100.0:
-                return 0.0
-            kde_val = self._kde_cdf_signal(data_series)
-            if kde_val > float(threshold):
-                return -1.0  # High VRP -> Short Vol
-            if kde_val < -float(threshold):
-                return 1.0   # Low VRP -> Long Vol
+        if pd.isna(curr_iv) or not np.isfinite(curr_iv):
+            return 0.0
+        if pd.isna(curr_rv) or not np.isfinite(curr_rv):
             return 0.0
 
-        rv22_signal = get_discrete_signal(VRP_rv22_test, self.VRP_rv22_threshold)
-        lt_signal = get_discrete_signal(VRP_lt_test, self.VRP_lt_threshold)
-        garch_signal = get_discrete_signal(VRP_garch_test, self.VRP_garch_threshold)
-        vvix_vix_signal = get_discrete_signal(vvix_vix_test, self.vvix_vix_threshold)
+        if len(self._rv_buf) < self.long_term_window:
+            self._rv_buf.append(float(curr_rv))
+            if len(self._rv_buf) > self._rv_buf_max:
+                self._rv_buf = self._rv_buf[-self._rv_buf_max :]
+            return 0.0
 
-        # Weighted composite signal (replaces equal-vote sum)
-        weighted_signal = (
-            self.signal_weights["rv22"] * rv22_signal
-            + self.signal_weights["lt"] * lt_signal
-            + self.signal_weights["garch"] * garch_signal
-            + self.signal_weights["vvix_vix"] * vvix_vix_signal
+        rv_signal = 0
+        if pd.notna(vrp) and np.isfinite(vrp):
+            self._vrp_history.append(float(vrp))
+            if len(self._vrp_history) >= self._MIN_SPREAD_OBS:
+                signal_window = np.asarray(
+                    self._vrp_history[-self.kde_rolling_window :], dtype=float
+                )
+                if np.sum(np.isfinite(signal_window)) >= 3:
+                    kde_signal = self._kde_cdf_signal(signal_window)
+                    if np.isfinite(kde_signal):
+                        if kde_signal > self.entry_threshold:
+                            rv_signal = -1
+                        elif kde_signal < -self.entry_threshold:
+                            rv_signal = 1
+
+        window_rv = self._rv_buf[-self.long_term_window :]
+        long_term_mean = float(np.mean(window_rv))
+        longterm_spread = float(curr_iv) - long_term_mean
+        ewma_rv = self._ewma_rv_annualized(self.current_days_to_strike)
+        ewma_spread = (
+            float(curr_iv) - float(ewma_rv) if np.isfinite(ewma_rv) else np.nan
         )
-        total_signal = 4.0 * weighted_signal
 
-        # Extra VVIX override signal
-        if vvix_test:
-            current_vvix = vvix_test[-1]
-            if current_vvix > self.vvix_short_gate:
-                total_signal -= 1.5
-                # Regime gate: under stress VVIX, block NEW short-vol impulse.
-                if total_signal < 0:
-                    total_signal = 0.0
+        self._longterm_spread_history.append(longterm_spread)
+        if np.isfinite(ewma_spread):
+            self._ewma_spread_history.append(ewma_spread)
 
-        # Hysteresis layer (entry/exit separated to reduce churn)
-        if self._signal_state == 0:
-            if total_signal >= self.entry_threshold:
-                self._signal_state = 1
-            elif total_signal <= -self.entry_threshold:
-                self._signal_state = -1
-        elif self._signal_state == 1:
-            if total_signal <= self.exit_threshold:
-                self._signal_state = 0
-        else:  # self._signal_state == -1
-            if total_signal >= -self.exit_threshold:
-                self._signal_state = 0
+        self._rv_buf.append(float(curr_rv))
+        if len(self._rv_buf) > self._rv_buf_max:
+            self._rv_buf = self._rv_buf[-self._rv_buf_max :]
 
-        if self._signal_state == 0:
-            return 0.0
-        if self._signal_state > 0:
-            return float(max(total_signal, self.entry_threshold))
-        return float(min(total_signal, -self.entry_threshold))
+        longterm_signal = 0
+        if len(self._longterm_spread_history) >= self._MIN_SPREAD_OBS:
+            spread_arr = np.asarray(
+                self._longterm_spread_history[-self.kde_rolling_window :], dtype=float
+            )
+            if np.sum(np.isfinite(spread_arr)) >= 3:
+                longterm_kde = self._kde_cdf_signal(spread_arr)
+                if np.isfinite(longterm_kde):
+                    if longterm_kde > self.entry_threshold:
+                        longterm_signal = -1
+                    elif longterm_kde < -self.entry_threshold:
+                        longterm_signal = 1
+
+        ewma_signal = 0
+        if len(self._ewma_spread_history) >= self._MIN_SPREAD_OBS and np.isfinite(ewma_spread):
+            ewma_arr = np.asarray(
+                self._ewma_spread_history[-self.kde_rolling_window :], dtype=float
+            )
+            if np.sum(np.isfinite(ewma_arr)) >= 3:
+                ewma_kde = self._kde_cdf_signal(ewma_arr)
+                if np.isfinite(ewma_kde):
+                    if ewma_kde > self.entry_threshold:
+                        ewma_signal = -1
+                    elif ewma_kde < -self.entry_threshold:
+                        ewma_signal = 1
+
+        overall_vote = rv_signal + longterm_signal + ewma_signal
+        return float(overall_vote)
 
     def search_option(self, option_chain, delta, ttm, option_type):
         chain_filtered = option_chain[
@@ -202,58 +253,24 @@ class Trading_Agent:
         }
 
     def _strategy_from_signal(self, trading_signal):
-        if trading_signal >= 3:
+        if trading_signal > 1:
             return {
                 "purpose": "long_vol",
-                "strategy_name": "bull_call_spread_20_10",
-                "legs": [
-                    {"delta": 0.2, "option_type": "call", "side": +1},
-                    {"delta": 0.1, "option_type": "call", "side": -1},
-                ],
-            }
-        if trading_signal >= 2:
-            return {
-                "purpose": "long_vol",
-                "strategy_name": "bull_call_spread_50_30",
+                "strategy_name": "long_straddle",
                 "legs": [
                     {"delta": 0.5, "option_type": "call", "side": +1},
-                    {"delta": 0.3, "option_type": "call", "side": -1},
+                    {"delta": 0.5, "option_type": "put", "side": +1},
                 ],
             }
-        if trading_signal >= 1:
-            return {
-                "purpose": "long_vol",
-                "strategy_name": "digital_bull_call_spread_atm",
-                "legs": [
-                    {"delta": 0.5, "option_type": "call", "side": +1},
-                    {"delta": 0.4, "option_type": "call", "side": -1},
-                ],
-            }
-        if trading_signal <= -3:
+        if trading_signal < -1:
             return {
                 "purpose": "short_vol",
-                "strategy_name": "bear_call_spread_20_10",
+                "strategy_name": "short_iron_condor",
                 "legs": [
-                    {"delta": 0.2, "option_type": "call", "side": -1},
-                    {"delta": 0.1, "option_type": "call", "side": +1},
-                ],
-            }
-        if trading_signal <= -2:
-            return {
-                "purpose": "short_vol",
-                "strategy_name": "bear_call_spread_50_30",
-                "legs": [
-                    {"delta": 0.5, "option_type": "call", "side": -1},
-                    {"delta": 0.3, "option_type": "call", "side": +1},
-                ],
-            }
-        if trading_signal <= -1:
-            return {
-                "purpose": "short_vol",
-                "strategy_name": "digital_bear_call_spread_atm",
-                "legs": [
-                    {"delta": 0.5, "option_type": "call", "side": -1},
-                    {"delta": 0.4, "option_type": "call", "side": +1},
+                    {"delta": 0.28, "option_type": "put", "side": -1},
+                    {"delta": 0.10, "option_type": "put", "side": +1},
+                    {"delta": 0.28, "option_type": "call", "side": -1},
+                    {"delta": 0.10, "option_type": "call", "side": +1},
                 ],
             }
         return None
@@ -331,6 +348,7 @@ class Trading_Agent:
         spread["open_cash_flow_per_spread"] = float(open_cash_flow_per_spread)
         self.strategy_positions.append(spread)
         self.position_purposes.append(spread["purpose"])
+        self.trade_purpose_history.append(spread["purpose"])
         return True
 
     def _update_leg_mark(self, leg, option_chain):
@@ -344,20 +362,20 @@ class Trading_Agent:
         for leg in spread["legs"]:
             self._update_leg_mark(leg, option_chain)
 
-    def _intrinsic_value(self, leg, vix_close):
+    def _intrinsic_value(self, leg, underlying_close):
         strike = leg["strike_price"]
         if leg["contract_type"] == "call":
-            return max(0.0, float(vix_close) - strike)
-        return max(0.0, strike - float(vix_close))
+            return max(float(underlying_close) - strike, 0.0)  # max(S-K, 0)
+        return max(strike - float(underlying_close), 0.0)  # max(K-S, 0)
 
-    def _close_spread(self, spread, option_chain=None, use_expiry=False, vix_close=None):
+    def _close_spread(self, spread, option_chain=None, use_expiry=False, underlying_close=None):
         qty = spread["qty"]
         close_cash_flow = 0.0
         spread_pnl = 0.0
 
         for leg in spread["legs"]:
             if use_expiry:
-                val = self._intrinsic_value(leg, vix_close)
+                val = self._intrinsic_value(leg, underlying_close)
             else:
                 if option_chain is not None:
                     self._update_leg_mark(leg, option_chain)
@@ -421,13 +439,9 @@ class Trading_Agent:
     def trade(self, option_chain, trading_signal):
         """
         Signal regime mapping:
-        3 <= s: close short_vol purpose, open long_vol 20/10 call spread
-        2 <= s < 3: close short_vol purpose, open long_vol 50/30 call spread
-        1 <= s < 2: close short_vol purpose, open long_vol atm digital-like spread
-       -1 <= s < 1: close all
-       -2 <= s < -1: close long_vol purpose, open short_vol atm digital-like spread
-       -3 <= s < -2: close long_vol purpose, open short_vol 50/30 call spread
-             s < -3: close long_vol purpose, open short_vol 20/10 call spread
+        s > 1: close short_vol purpose, open long_straddle
+        -1 <= s <= 1: close all
+        s < -1: close long_vol purpose, open short_iron_condor
         """
         target = self._strategy_from_signal(trading_signal)
 
@@ -452,7 +466,7 @@ class Trading_Agent:
         if spread is not None:
             self._open_spread(spread)
 
-    def calculate_pnl(self, option_chain, today, vix_close):
+    def calculate_pnl(self, option_chain, today, underlying_close):
         today_ts = pd.Timestamp(today)
 
         # Mark to market all open spreads.
@@ -463,7 +477,7 @@ class Trading_Agent:
         kept = []
         for spread in self.strategy_positions:
             if today_ts >= spread["expiration_date"]:
-                self._close_spread(spread, use_expiry=True, vix_close=vix_close)
+                self._close_spread(spread, use_expiry=True, underlying_close=underlying_close)
             else:
                 kept.append(spread)
 
@@ -501,8 +515,8 @@ class Trading_Agent:
 
     def get_long_short_pnl(self):
         return {
-            "long_vol_buy_call_pnl": float(self.realized_long_pnl),
-            "short_vol_call_spread_pnl": float(self.realized_short_pnl),
+            "long_vol_straddle_pnl": float(self.realized_long_pnl),
+            "short_vol_iron_condor_pnl": float(self.realized_short_pnl),
         }
 
     def get_log_returns(self, initial_capital=None):

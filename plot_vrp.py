@@ -37,17 +37,15 @@ def plot_kde(ax, sample, title, color):
 
 def plot_vrp(Agents):
     a = Agents
-    test_len = a.test_length
-    rv22_sample = random_window(a.memory.VRP_rv22, test_len)
-    lt_sample = random_window(a.memory.VRP_lt, test_len)
-    garch_sample = random_window(a.memory.VRP_garch, test_len)
-    vvix_vix_sample = random_window(a.memory.vvix_vix, test_len)
+    test_len = a.long_term_window
+    vrp_sample = random_window(a._vrp_history, test_len)
+    longterm_sample = random_window(a._longterm_spread_history, test_len)
+    ewma_sample = random_window(a._ewma_spread_history, test_len)
 
-    fig, axes = plt.subplots(1, 4, figsize=(15, 4))
-    plot_kde(axes[0], rv22_sample, f'VRP_rv22 KDE (random window={test_len})', 'skyblue')
-    plot_kde(axes[1], lt_sample, f'VRP_lt KDE (random window={test_len})', 'salmon')
-    plot_kde(axes[2], garch_sample, f'VRP_garch KDE (random window={test_len})', 'lightgreen')
-    plot_kde(axes[3], vvix_vix_sample, f'VVIX_VIX KDE (random window={test_len})', 'plum')
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    plot_kde(axes[0], vrp_sample, f'VRP KDE (random window={test_len})', 'skyblue')
+    plot_kde(axes[1], longterm_sample, f'Longterm Spread KDE (random window={test_len})', 'salmon')
+    plot_kde(axes[2], ewma_sample, f'EWMA Spread KDE (random window={test_len})', 'lightgreen')
 
     plt.tight_layout()
     plt.show()
